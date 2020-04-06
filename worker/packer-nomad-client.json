@@ -1,0 +1,157 @@
+{
+    "variables": {
+        "region": "eu-west-3",
+        "consul_version": "1.5.2",
+        "nomad_version": "0.9.3",
+        "sourceami": "ami-0119667e27598718e"
+    },
+    "builders": [
+        {
+            "type": "amazon-ebs",
+            "region": "{{ user `aws_region` }}",
+            "source_ami": "{{ user `sourceami` }}",
+            "instance_type": "t2.micro",
+            "ssh_username": "ubuntu",
+            "ami_name": "hashicorp-nomad-client-{{ user `nomad_version` }}-{{ timestamp }}",
+            "tags": {
+                "Generation": "1.0.0",
+                "OS": "Ubuntu 18.04 LTS",
+                "Name": "hashicorp-nomad-client-{{ user `nomad_version` }}-{{ timestamp }}",
+                "Version": "{{ user `nomad_version` }}"
+            },
+            "run_tags": {
+                "cbp.application": "plateformes",
+                "cbp.contact": "dtd-platforms@cbp-group.com",
+                "cbp.environment": "sandbox",
+                "cbp.owner": "plateformes",
+                "cbp.service": "plateformes-services"
+            }
+        }
+    ],
+    "provisioners": [
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing common packages...\"",
+                "sleep 60",
+                "sudo apt-get update -y",
+                "sudo apt-get install -y wget curl unzip python-pip jq apt-transport-https ca-certificates gnupg-agent software-properties-common",
+                "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -",
+                "sudo apt-key fingerprint 0EBFCD88",
+                "sudo add-apt-repository \"deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\"",
+                "sudo apt-get update",
+                "sudo apt-get install -y docker-ce docker-ce-cli containerd.io",
+                "sudo systemctl status docker",
+                "sudo usermod -aG docker ubuntu",
+                "curl -L https://my-netdata.io/kickstart-static64.sh | bash -s -- --non-interactive",
+                "sudo pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz"
+            ]
+        },
+        {
+            "type": "file",
+            "source": "config.json",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing docker-credential-ecr-login ...\"",
+                "curl -LO https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.3.1/linux-amd64/docker-credential-ecr-login",
+                "chmod a+x docker-credential-ecr-login",
+                "sudo mv docker-credential-ecr-login /usr/local/bin/",
+                "mkdir /home/ubuntu/.docker",
+                "sudo mv /tmp/config.json /home/ubuntu/.docker/"
+            ]
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing consul...\"",
+                "curl -LO https://releases.hashicorp.com/consul/{{ user `consul_version` }}/consul_{{ user `consul_version` }}_linux_amd64.zip",
+                "unzip ./consul_*_linux_amd64.zip",
+                "sudo mv consul /usr/bin/",
+                "consul --version",
+                "sudo mkdir -p /etc/consul.d /var/consul"
+            ]
+        },
+        {
+            "type": "file",
+            "source": "consul.service",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "file",
+            "source": "consul.hcl",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "sudo mv /tmp/consul.hcl /etc/consul.d/",
+                "sudo mv /tmp/consul.service /etc/systemd/system/",
+                "echo \"Enabling consul service...\"",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable consul.service"
+            ]
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing nomad...\"",
+                "curl -LO https://releases.hashicorp.com/nomad/{{ user `nomad_version` }}/nomad_{{ user `nomad_version` }}_linux_amd64.zip",
+                "unzip ./nomad_*_linux_amd64.zip",
+                "sudo mv nomad /usr/local/bin/",
+                "nomad --version",
+                "sudo mkdir -p /etc/nomad.d /opt/nomad"
+            ]
+        },
+        {
+            "type": "file",
+            "source": "amazon-cloudwatch-agent.json",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing CloudWatch Agent...\"",
+                "sudo groupadd -r cwagent >/dev/null 2>&1",
+                "sudo useradd -r -M cwagent -d /home/cwagent -g cwagent >/dev/null 2>&1",
+                "curl -LO https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb",
+                "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc/",
+                "sudo chown cwagent:cwagent -R /opt/aws/amazon-cloudwatch-agent/etc/",
+                "sudo mv /tmp/amazon-cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/",
+                "sudo dpkg -i amazon-cloudwatch-agent.deb",
+                "echo \"Enabling CloudWatch Agent service...\"",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable amazon-cloudwatch-agent"
+            ]
+        },
+        {
+            "type": "file",
+            "source": "nomad.service",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "file",
+            "source": "nomad.hcl",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "file",
+            "source": "client.hcl",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "sudo mv /tmp/nomad.hcl /etc/nomad.d/",
+                "sudo mv /tmp/client.hcl /etc/nomad.d/",
+                "sudo mv /tmp/nomad.service /etc/systemd/system/",
+                "echo \"Enabling nomad service...\"",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable nomad.service"
+            ]
+        }
+
+    ]
+}

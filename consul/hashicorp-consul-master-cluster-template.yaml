@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: This template creates a Consul cluster using Amazon EC2 AutoScaling groups.
+
+Parameters:
+  Compte:
+    Type: String
+    AllowedValues:
+      - prod
+      - preprod
+      - qa
+      - dev
+      - sandbox
+  Environment:
+    Type: String
+    MinLength: 1
+  BaseImageId:
+    Type: String
+    Description: AMI ID of consul image which is built from packer template
+  InstanceType:
+    Type: String
+    Description: Instance type to launch EC2 instances
+    Default: t3.medium
+  DataVolumeSize:
+    Type: Number
+    MinValue: 10
+    Default: 10
+    ConstraintDescription: Must greater than 10
+  NumberOfServers:
+    Description: Number of servers
+    Type: Number
+    MinValue: 3
+    MaxValue: 9
+    Default: 3
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access into servers
+
+Resources:
+  ConsulSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Consul servers
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      SecurityGroupIngress:
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          Description: Allow SSH
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8300
+          ToPort: 8300
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8301
+          ToPort: 8301
+          IpProtocol: udp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8301
+          ToPort: 8301
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8302
+          ToPort: 8302
+          IpProtocol: udp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8302
+          ToPort: 8302
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8500
+          ToPort: 8500
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8600
+          ToPort: 8600
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8600
+          ToPort: 8600
+          IpProtocol: udp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 21000
+          ToPort: 21000
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 21255
+          ToPort: 21255
+          IpProtocol: tcp
+      Tags:
+        - Key: Name
+          Value: Consul Security Group
+
+  ConsulServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !Ref NumberOfServers
+      HealthCheckGracePeriod: 120
+      HealthCheckType: ELB
+      TargetGroupARNs:
+        - !Ref ConsulTargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ConsulLaunchTemplate
+        Version: !GetAtt ConsulLaunchTemplate.LatestVersionNumber
+      MinSize: 3
+      MaxSize: 9
+      MetricsCollection:
+        -
+          Granularity: 1Minute
+      VPCZoneIdentifier:
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZaid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZbid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZcid'}
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 2
+        PauseTime: PT5M
+        SuspendProcesses:
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  ConsulLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref BaseImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !GetAtt ConsulSecurityGroup.GroupId
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              DeleteOnTermination: true
+              VolumeSize: !Ref DataVolumeSize
+              VolumeType: gp2
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            PS4='+\\t '
+            rm /var/tmp/aws-mon/instance-id || echo No file to remove, check the base image
+            # configure consul
+            sed -i "s#DATACENTER#cbp-${Compte}-${AWS::Region}-${Environment}#g" /etc/consul.d/consul.hcl
+            sed -i "s#JOIN_TAG#server-${Compte}-${AWS::Region}-${Environment}#g" /etc/consul.d/consul.hcl
+            sed -i "s#BOOTSTRAPEXPECTED#${NumberOfServers}#g" /etc/consul.d/server.hcl
+            systemctl restart consul
+
+            HTTP_STATUS=0
+            CHECK_URL=http://localhost:8500/ui/
+            HTTP_STATUS=$(curl -i -silent $CHECK_URL | head -n 1|cut -d$' ' -f2)
+            until [[ $HTTP_STATUS -eq 200 ]]; do
+                HTTP_STATUS=$(curl -i -silent $CHECK_URL | head -n 1|cut -d$' ' -f2)
+                sleep 2
+            done
+
+            # Signal the status from cfn-init
+            cfn-signal -e $? --stack ${AWS::StackName} --resource ConsulServerAutoScalingGroup --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Consul server
+              - Key: consul-auto-join
+                Value: !Sub 'server-${Compte}-${AWS::Region}-${Environment}'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: Consul server
+
+  ConsulLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group load balancer of consul server cluster
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+      Tags:
+        - Key: Name
+          Value: Consul server load balancer security group
+
+  ConsulLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZaid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZbid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZcid'}
+      SecurityGroups:
+        - !GetAtt ConsulLoadBalancerSecurityGroup.GroupId
+
+  ConsulTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: HTTP
+      Port: 8500
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 8500
+      HealthCheckPath: /v1/health/checks/consul
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+
+  ConsulUiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ConsulTargetGroup
+      LoadBalancerArn: !Ref ConsulLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DescribeInstanceRole
+
+  DescribeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: describe-instances-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource:
+                  - "*"
+
+  InternalDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        HostedZoneId: !GetAtt ConsulLoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt ConsulLoadBalancer.DNSName
+      Comment: !Sub 'Internal DNS name for Consul cluster ${Compte}-${AWS::Region}-${Environment}'
+      HostedZoneName: !Sub ${Compte}.apps.cbp.solutions.
+      Name: !Sub 'consul.${Compte}-${AWS::Region}-${Environment}.${Compte}.apps.cbp.solutions'
+      Type: A
+
+Outputs:
+  NomadClusterUrl:
+    Description: URL to access Consul UI of the cluster
+    Value: !Ref InternalDNSRecord
+
+

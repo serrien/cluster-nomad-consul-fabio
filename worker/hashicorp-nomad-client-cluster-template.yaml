@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: This template creates a Nomad client cluster using Amazon EC2 AutoScaling groups.
+
+Parameters:
+  Compte:
+    Type: String
+    AllowedValues:
+      - prod
+      - preprod
+      - qa
+      - dev
+      - sandbox
+  Environment:
+    Type: String
+    MinLength: 1
+  BaseImageId:
+    Type: String
+    Description: AMI ID of nomad image which is built from packer template
+  InstanceType:
+    Type: String
+    Description: Instance type to launch EC2 instances
+    Default: t3.medium
+  DataVolumeSize:
+    Type: Number
+    MinValue: 10
+    Default: 10
+    ConstraintDescription: Must greater than 10
+  NumberOfClients:
+    Description: Number of clients
+    Type: Number
+    MinValue: 1
+    Default: 3
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access into clients
+
+Resources:
+  NomadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Nomad clients
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      SecurityGroupIngress:
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          Description: Allow SSH
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8301
+          ToPort: 8301
+          IpProtocol: udp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 8301
+          ToPort: 8301
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 4646
+          ToPort: 4646
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 4647
+          ToPort: 4647
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 9999
+          ToPort: 9999
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 9998
+          ToPort: 9998
+          IpProtocol: tcp
+        - CidrIp: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-VpcCidr'}
+          FromPort: 9991
+          ToPort: 9991
+          IpProtocol: tcp
+        - CidrIp: 0.0.0.0/0
+          Description: Allow netdata
+          FromPort: 19999
+          ToPort: 19999
+          IpProtocol: tcp
+      Tags:
+        - Key: Name
+          Value: Nomad Security Group
+
+  NomadSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: NomadSecurityGroup
+    Properties:
+      GroupId: !Ref NomadSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref NomadSecurityGroup
+
+
+  NomadClientAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !Ref NumberOfClients
+      HealthCheckGracePeriod: 120
+      HealthCheckType: ELB
+      TargetGroupARNs:
+        - !Ref SigsciHttpTargetGroup
+        - !Ref FabioUiTargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NomadLaunchTemplate
+        Version: !GetAtt NomadLaunchTemplate.LatestVersionNumber
+      MinSize: 3
+      MaxSize: 9
+      MetricsCollection:
+        - Granularity: 1Minute
+      VPCZoneIdentifier:
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZaid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZbid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZcid'}
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 2
+        PauseTime: PT5M
+        SuspendProcesses:
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  NomadLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref BaseImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !GetAtt NomadSecurityGroup.GroupId
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              DeleteOnTermination: true
+              VolumeSize: !Ref DataVolumeSize
+              VolumeType: gp2
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            PS4='+\\t '
+            rm /var/tmp/aws-mon/instance-id || echo No file to remove, check the base image
+
+            export LOCAL_IP=$(curl http://169.254.169.254/latest/meta-data/local-ipv4)
+            # configure consul
+            sed -i "s#BIND_ADDRESS#${!LOCAL_IP}#g" /etc/consul.d/consul.hcl
+            sed -i "s#DATACENTER#cbp-${Compte}-${AWS::Region}-${Environment}#g" /etc/consul.d/consul.hcl
+            sed -i "s#JOIN_TAG#server-${Compte}-${AWS::Region}-${Environment}#g" /etc/consul.d/consul.hcl
+            systemctl restart consul
+
+            HTTP_STATUS=0
+            CHECK_URL=http://localhost:8500/v1/health/checks/consul
+            HTTP_STATUS=$(curl -i -silent $CHECK_URL | head -n 1|cut -d$' ' -f2)
+            until [[ $HTTP_STATUS -eq 200 ]]; do
+                HTTP_STATUS=$(curl -i -silent $CHECK_URL | head -n 1|cut -d$' ' -f2)
+                sleep 2
+            done
+
+            # configure nomad
+            sed -i "s#DATACENTER#cbp-${Compte}-${AWS::Region}-${Environment}#g" /etc/nomad.d/nomad.hcl
+            systemctl restart nomad
+
+            HTTP_STATUS=0
+            CHECK_URL=http://localhost:4646/v1/agent/health
+            HTTP_STATUS=$(curl -i -silent $CHECK_URL | head -n 1|cut -d$' ' -f2)
+            until [[ $HTTP_STATUS -eq 200 ]]; do
+                HTTP_STATUS=$(curl -i -silent $CHECK_URL | head -n 1|cut -d$' ' -f2)
+                sleep 2
+            done
+
+            # Signal the status from cfn-init
+            cfn-signal -e $? --stack ${AWS::StackName} --resource NomadClientAutoScalingGroup --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Nomad client
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: Nomad client
+
+  NomadLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group load balancer of nomad client cluster
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 9999
+          IpProtocol: tcp
+        - CidrIp: 0.0.0.0/0
+          FromPort: 9998
+          ToPort: 9998
+          IpProtocol: tcp
+      Tags:
+        - Key: Name
+          Value: Nomad client load balancer security group
+
+  NomadLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZaid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZbid'}
+        - {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-PrivateSubnetAZcid'}
+      SecurityGroups:
+        - !GetAtt NomadLoadBalancerSecurityGroup.GroupId
+
+  FabioUiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: HTTP
+      Port: 9998
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 4646
+      HealthCheckPath: /v1/agent/health
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+
+
+
+  SigsciHttpTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: HTTP
+      Port: 9991
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 4646
+      HealthCheckPath: /v1/agent/health
+      VpcId: {'Fn::ImportValue': !Sub 'cbp-${Compte}-vpc-Vpcid'}
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+
+  FabioHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: arn:aws:acm:eu-west-3:370779979152:certificate/e18f63eb-5acd-4e85-9745-27050e19a47b
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SigsciHttpTargetGroup
+      LoadBalancerArn: !Ref NomadLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+  FabioListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - RedirectConfig:
+            Host: '#{host}'
+            Path: '/#{path}'
+            Port: '443'
+            Query: '#{query}'
+            Protocol: HTTPS
+            StatusCode: HTTP_301
+          Type: 'redirect'
+      LoadBalancerArn: !Ref NomadLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  FabioUiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FabioUiTargetGroup
+      LoadBalancerArn: !Ref NomadLoadBalancer
+      Port: 9998
+      Protocol: HTTP
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DescribeInstanceRole
+
+  DescribeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Policies:
+        - PolicyName: worker-nomad-instances-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                  - ecr:GetLifecyclePolicyPreview
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:GetAuthorizationToken
+                  - ecr:ListTagsForResource
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetRepositoryPolicy
+                  - ecr:GetLifecyclePolicy
+                Resource:
+                  - "*"
+
+  InternalDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        HostedZoneId: !GetAtt NomadLoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt NomadLoadBalancer.DNSName
+      Comment: !Sub 'Internal DNS name for Nomad client cluster ${Compte}-${AWS::Region}-${Environment}'
+      HostedZoneName: !Sub ${Compte}.apps.cbp.solutions.
+      Name: !Sub 'nomad-client.${Compte}-${AWS::Region}-${Environment}.${Compte}.apps.cbp.solutions'
+      Type: A
+
+Outputs:
+  NomadClusterUrl:
+    Description: URL to access Nomad Client cluster
+    Value: !Ref InternalDNSRecord
+

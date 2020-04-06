@@ -1,0 +1,80 @@
+{
+    "variables": {
+        "region": "eu-west-3",
+        "consul_version": "1.5.2",
+        "sourceami": "ami-0119667e27598718e"
+    },
+    "builders": [
+        {
+            "type": "amazon-ebs",
+            "region": "{{ user `aws_region` }}",
+            "source_ami": "{{ user `sourceami` }}",
+            "instance_type": "t2.micro",
+            "ssh_username": "ubuntu",
+            "ami_name": "hashicorp-consul-{{ user `consul_version` }}-{{ timestamp }}",
+            "tags": {
+                "Generation": "1.0.0",
+                "OS": "Ubuntu 18.04 LTS",
+                "Name": "hashicorp-consul-{{ user `consul_version` }}-{{ timestamp }}",
+                "Version": "{{ user `consul_version` }}"
+            },
+            "run_tags": {
+                "cbp.application": "plateformes",
+                "cbp.contact": "dtd-platforms@cbp-group.com",
+                "cbp.environment": "sandbox",
+                "cbp.owner": "plateformes",
+                "cbp.service": "plateformes-services"
+            }
+        }
+    ],
+    "provisioners": [
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing common packages...\"",
+                "sleep 60",
+                "sudo apt-get update -y",
+                "sudo apt-get install -y wget curl unzip python-pip jq",
+                "curl -L https://my-netdata.io/kickstart-static64.sh | bash -s -- --non-interactive",
+                "sudo pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz"
+            ]
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "echo \"Installing consul...\"",
+                "curl -LO https://releases.hashicorp.com/consul/{{ user `consul_version` }}/consul_{{ user `consul_version` }}_linux_amd64.zip",
+                "unzip ./consul_*_linux_amd64.zip",
+                "sudo mv consul /usr/bin/",
+                "consul --version",
+                "sudo mkdir -p /etc/consul.d /var/consul"
+            ]
+        },
+        {
+            "type": "file",
+            "source": "consul.service",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "file",
+            "source": "consul.hcl",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "file",
+            "source": "server.hcl",
+            "destination": "/tmp/"
+        },
+        {
+            "type": "shell",
+            "inline": [
+                "sudo mv /tmp/consul.hcl /etc/consul.d/",
+                "sudo mv /tmp/server.hcl /etc/consul.d/",
+                "sudo mv /tmp/consul.service /etc/systemd/system/",
+                "echo \"Enabling consul service...\"",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable consul.service"
+            ]
+        }
+    ]
+}
